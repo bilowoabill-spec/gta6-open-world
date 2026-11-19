@@ -1,134 +1,237 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
-//
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
-import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// Solara Bay — main loop and wiring. Builds the world, runs the states
+// (menu, playing, paused, game over, win), updates every system and draws
+// each frame. Exposes window.__solara for automated smoke tests.
+import { WORLD } from './config.js';
+import { makeRng, clamp } from './rng.js';
+import { buildCity, hitBuilding } from './world.js';
+import { SoundEngine } from './audio.js';
+import { Input } from './input.js';
+import { createPlayer, updatePlayer, hurtPlayer } from './player.js';
+import { createTraffic, updateTraffic, scarePeds } from './traffic.js';
+import { createPolice, updatePolice, nearestCopDist, addWanted } from './police.js';
+import { createMissions, updateMissions, startMissions } from './missions.js';
+import { drawWorld } from './render.js';
+import { Hud } from './hud.js';
 import { stageShot } from './shots.js';
 
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
-const MAX_FRAME = 0.25;
-
-const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
-const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
-
 const canvas = document.getElementById('game');
-const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
-const renderer = createRenderer(canvas);
+const ctx = canvas.getContext('2d');
 
-function readBest() {
-  try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
-  } catch {
-    return 0;
-  }
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+const params = new URLSearchParams(location.search);
+const shot = params.get('shot');
+const seed = Number(params.get('seed') || 20261119);
+
+const G = {
+  time: 0,
+  state: 'menu', // menu | playing | paused | over | win
+  rng: makeRng(seed),
+  city: buildCity(seed),
+  player: createPlayer(),
+  traffic: null,
+  police: createPolice(),
+  missions: createMissions(),
+  input: new Input(canvas),
+  sound: new SoundEngine(),
+  bullets: [],
+  particles: [],
+  shake: 0,
+  camera: { x: 0, y: 0 },
+  viewW: canvas.width,
+  viewH: canvas.height,
+  hud: null,
+};
+G.traffic = createTraffic(G.city, G.rng);
+G.hud = new Hud(G);
+// Nearest-cop helper and crime reporter the player module uses.
+G.police.nearestCopDist = (x, y) => nearestCopDist(G, x, y);
+G.police.addWanted = (stars, kind) => addWanted(G, stars, kind);
+
+G.startStory = function () {
+  resetWorld(G);
+  G.missions.active = true;
+  startMissions(G);
+  G.state = 'playing';
+};
+
+G.startFreeRoam = function () {
+  resetWorld(G);
+  G.missions.active = false;
+  G.state = 'playing';
+};
+
+// Fresh world for a new run (keeps the same city layout).
+function resetWorld(G) {
+  G.player = createPlayer();
+  G.traffic = createTraffic(G.city, G.rng);
+  G.police = createPolice();
+  G.police.nearestCopDist = (x, y) => nearestCopDist(G, x, y);
+  G.police.addWanted = (stars, kind) => addWanted(G, stars, kind);
+  G.missions = createMissions();
+  G.bullets = [];
+  G.particles = [];
+  G.time = 0;
 }
 
-function saveBest(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off (private windows): the best score then lasts this visit only.
+G.resetRun = function () {
+  resetWorld(G);
+  startMissions(G);
+  G.state = 'playing';
+};
+
+function update(dt) {
+  const p = G.player;
+  // Pause / mute / restart keys.
+  if (G.input.wasPressed('p', 'escape')) {
+    if (G.state === 'playing') { G.state = 'paused'; G.hud.showPause(); }
+    else if (G.state === 'paused') { G.state = 'playing'; G.hud.hideMenu(); }
   }
+  if (G.input.wasPressed('m')) G.sound.setMuted(!G.sound.muted);
+  if (G.state !== 'playing') return;
+
+  G.time += dt;
+  updatePlayer(G, dt);
+  updateTraffic(G, dt);
+  updatePolice(G, dt);
+  updateMissions(G, dt);
+  updateBullets(G, dt);
+
+  // Particles age out.
+  for (const pt of G.particles) pt.life -= dt;
+  G.particles = G.particles.filter((pt) => pt.life > 0);
+  G.shake = Math.max(0, G.shake - dt * 26);
+
+  // Camera follows the player, clamped to the world.
+  const tx = clamp(p.x - G.viewW / 2, 0, WORLD.size - G.viewW);
+  const ty = clamp(p.y - G.viewH / 2, 0, WORLD.size - G.viewH);
+  G.camera.x += (tx - G.camera.x) * Math.min(1, dt * 5);
+  G.camera.y += (ty - G.camera.y) * Math.min(1, dt * 5);
+
+  // Engine hum follows the driven car.
+  if (!p.onFoot && p.car) G.sound.engine(Math.abs(p.car.speed) / p.car.model.top);
+  else G.sound.engine(0);
+
+  // End states.
+  if (p.dead && G.state === 'playing') { G.state = 'over'; G.hud.showGameOver(false); }
+  if (p.busted && G.state === 'playing') { G.state = 'over'; G.hud.showGameOver(true); }
+  if (G.missions.done && G.state === 'playing') { G.state = 'win'; G.hud.showWin(); }
 }
 
-function runShot(name) {
-  const scene = stageShot(name, world);
-  let painted = 0;
-  function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
-  }
-  requestAnimationFrame(paint);
-}
-
-function runGame() {
-  const input = createInput(canvas);
-  let screen = SCREEN_TITLE;
-  let best = readBest();
-  let accumulator = 0;
-  let last = performance.now();
-
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
-  function announce(message) {
-    status.textContent = message;
-  }
-
-  function startGame() {
-    world.reset();
-    accumulator = 0;
-    screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
-  }
-
-  function endGame() {
-    screen = SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
-      saveBest(best);
-    }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
-  }
-
-  function handleActions() {
-    const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
-    }
-  }
-
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
-      return;
-    }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
-  }
-
-  function frame(now) {
-    requestAnimationFrame(frame);
-    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
-    last = now;
-    handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
-        accumulator -= STEP;
+function updateBullets(G, dt) {
+  const p = G.player;
+  for (const b of G.bullets) {
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    b.life -= dt;
+    // Buildings stop bullets.
+    if (hitBuilding(G.city, b.x, b.y, 2)) { b.life = 0; continue; }
+    if (b.fromPlayer) {
+      // Hit a thug?
+      for (const th of G.traffic.thugs) {
+        if (th.alive && Math.hypot(th.x - b.x, th.y - b.y) < 14) {
+          th.health -= b.damage;
+          b.life = 0;
+          G.particles.push({ x: b.x, y: b.y, life: 0.3, max: 0.3, kind: 'hit' });
+          if (th.health <= 0) th.alive = false;
+          break;
+        }
+      }
+      if (b.life <= 0) continue;
+      // Hit a pedestrian? That is a crime.
+      for (const ped of G.traffic.peds) {
+        if (ped.alive && Math.hypot(ped.x - b.x, ped.y - b.y) < 10) {
+          ped.alive = false; ped.dead = true;
+          b.life = 0;
+          G.police.addWanted(1, 'shot a pedestrian');
+          scarePeds(G, ped.x, ped.y, 300);
+          G.particles.push({ x: ped.x, y: ped.y, life: 0.5, max: 0.5, kind: 'poof' });
+          break;
+        }
+      }
+      if (b.life <= 0) continue;
+      // Hit a cop? That is a bigger crime.
+      for (const cop of G.police.cops) {
+        if (Math.hypot(cop.x - b.x, cop.y - b.y) < 12) {
+          b.life = 0;
+          G.police.cops.splice(G.police.cops.indexOf(cop), 1);
+          G.police.addWanted(2, 'shot a cop');
+          scarePeds(G, cop.x, cop.y, 300);
+          break;
+        }
+      }
+      if (b.life <= 0) continue;
+      // Hit a car?
+      for (const car of G.traffic.cars) {
+        if (car.wrecked) continue;
+        if (Math.hypot(car.x - b.x, car.y - b.y) < 24) {
+          car.health -= b.damage;
+          b.life = 0;
+          if (car.health <= 0) {
+            car.wrecked = true;
+            car.speed = 0;
+            G.particles.push({ x: car.x, y: car.y, life: 0.6, max: 0.6, kind: 'poof' });
+            if (car.driver === 'player') {
+              G.player.car = null;
+              G.player.onFoot = true;
+              G.hud.toast('Your car is wrecked!');
+            }
+          }
+          break;
+        }
       }
     } else {
-      accumulator = 0;
+      // Enemy bullet: only the player can be hit.
+      if (!p.dead && !p.busted && Math.hypot(p.x - b.x, p.y - b.y) < 14) {
+        hurtPlayer(G, b.damage);
+        b.life = 0;
+      }
     }
-    renderer.draw(world.state, screen, best);
   }
-
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    }
-  });
-
-  announce('Block Dodger. Press Space or click to start.');
-  requestAnimationFrame(frame);
+  G.bullets = G.bullets.filter((b) => b.life > 0);
 }
 
-if (shot) runShot(shot);
-else runGame();
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(0.05, (now - (frame.last || now)) / 1000 || 0.016);
+  frame.last = now;
+  G.viewW = canvas.width;
+  G.viewH = canvas.height;
+  update(dt);
+  if (G.state === 'playing' || G.state === 'paused' || G.state === 'over' || G.state === 'win') {
+    drawWorld(ctx, G, G.viewW, G.viewH);
+    G.hud.update(dt);
+  } else {
+    // Menu: draw the city behind the title.
+    drawWorld(ctx, G, G.viewW, G.viewH);
+    G.hud.update(dt);
+  }
+  G.input.endFrame();
+}
+
+// Staged screenshot scenes, or the normal menu.
+if (shot) {
+  stageShot(G, shot);
+  // Let the world settle for a moment before the first paint.
+  G.camera.x = clamp(G.player.x - G.viewW / 2, 0, WORLD.size - G.viewW);
+  G.camera.y = clamp(G.player.y - G.viewH / 2, 0, WORLD.size - G.viewH);
+} else {
+  G.hud.showStart();
+}
+
+requestAnimationFrame(frame);
+
+// Test hook for the automated smoke test (invisible in play).
+window.__solara = {
+  G,
+  state: () => G.state,
+  player: () => ({ x: G.player.x, y: G.player.y, onFoot: G.player.onFoot, health: G.player.health, money: G.player.money }),
+  wanted: () => G.police.stars,
+  mission: () => ({ index: G.missions.index, step: G.missions.stepIndex, done: G.missions.done }),
+  counts: () => ({ cars: G.traffic.cars.length, peds: G.traffic.peds.filter((w) => w.alive).length, cops: G.police.cops.length, copCars: G.police.copCars.length }),
+};
